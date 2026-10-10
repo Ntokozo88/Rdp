@@ -6,7 +6,7 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360
 
     steps:
       - name: Configure Core RDP Settings
@@ -28,8 +28,7 @@ jobs:
             dir=in `
             action=allow `
             protocol=TCP `
-            localport=3389 `
-            remoteip=LocalSubnet
+            localport=3389
 
           Restart-Service -Name TermService -Force
 
@@ -37,7 +36,7 @@ jobs:
         shell: powershell
         run: |
           $username = "Zwiderh"
-          $password = "mpendulo"
+          $password = "Mpendulo@2026!Rdp"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
           $existingUser = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
@@ -47,7 +46,8 @@ jobs:
           } else {
             New-LocalUser -Name $username `
               -Password $securePass `
-              -AccountNeverExpires
+              -AccountNeverExpires `
+              -PasswordNeverExpires
           }
 
           Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
