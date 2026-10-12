@@ -3,6 +3,9 @@ name: RDP
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   secure-rdp:
     runs-on: windows-latest
@@ -12,101 +15,133 @@ jobs:
       - name: Configure Core RDP Settings
         shell: powershell
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
+          $ErrorActionPreference = "Stop"
 
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 1 -Force
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" `
+            -Value 0
 
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" -Value 2 -Force
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" `
+            -Value 1
 
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" `
+            -Value 2
 
-          netsh advfirewall firewall add rule `
-            name="RDP-Tailscale" `
-            dir=in `
-            action=allow `
-            protocol=TCP `
-            localport=3389
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-          Restart-Service -Name TermService -Force
+          Write-Host "RDP settings configured."
 
       - name: Create RDP User
         shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $username = "Zwiderh"
-          $password = "Mpendulo@2026!Rdp"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          $ErrorActionPreference = "Stop"
 
-          $existingUser = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Create the RDP_PASSWORD repository secret first."
+          }
+
+          $username = "Zwiderh"
+          $securePass = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText `
+            -Force
+
+          $existingUser = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
 
           if ($existingUser) {
             Set-LocalUser -Name $username -Password $securePass
           } else {
-            New-LocalUser -Name $username `
+            New-LocalUser `
+              -Name $username `
               -Password $securePass `
               -AccountNeverExpires `
               -PasswordNeverExpires
           }
 
-          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
 
-          Write-Host "RDP user configured successfully."
-          Write-Host "Username: $username"
-          Write-Host "Password: [hidden]"
+          Write-Host "RDP user configured."
 
       - name: Install Tailscale
         shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
+
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = Join-Path $env:RUNNER_TEMP "tailscale.msi"
 
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
 
           if (-not (Test-Path $installerPath)) {
-            Write-Error "Tailscale installer was not downloaded."
-            exit 1
+            throw "Tailscale installer was not downloaded."
           }
 
-          Start-Process msiexec.exe `
+          $process = Start-Process msiexec.exe `
             -ArgumentList "/i `"$installerPath`" /quiet /norestart" `
             -Wait `
-            -NoNewWindow
+            -PassThru
 
-          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
-            Write-Error "Tailscale installation failed."
-            exit 1
+          if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) {
+            throw "Tailscale installation failed with exit code $($process.ExitCode)."
           }
 
-          Remove-Item $installerPath -Force
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+
+          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
+            throw "Tailscale executable was not found after installation."
+          }
+
+          Write-Host "Tailscale installed."
 
       - name: Establish Tailscale Connection
         shell: powershell
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
+          $ErrorActionPreference = "Stop"
+
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-            Write-Error "Add TAILSCALE_AUTH_KEY to your GitHub repository secrets."
-            exit 1
+            throw "Create the TAILSCALE_AUTH_KEY repository secret first."
           }
 
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
+          # Check that the Tailscale service is running.
+          $service = Get-Service -Name Tailscale -ErrorAction Stop
+
+          if ($service.Status -ne "Running") {
+            Start-Service -Name Tailscale
+            Start-Sleep -Seconds 5
+          }
+
           & $tailscale up `
-            --authkey="$env:TAILSCALE_AUTH_KEY" `
-            --hostname="gh-runner-$env:GITHUB_RUN_ID"
+            "--authkey=$env:TAILSCALE_AUTH_KEY" `
+            "--hostname=gh-runner-$env:GITHUB_RUN_ID"
 
           if ($LASTEXITCODE -ne 0) {
-            Write-Error "Tailscale connection failed."
-            exit 1
+            throw "Tailscale connection failed."
           }
 
           $tsIP = $null
 
           for ($i = 0; $i -lt 12; $i++) {
-            $tsIP = (& $tailscale ip -4 | Select-Object -First 1).Trim()
+            $ipOutput = & $tailscale ip -4 2>$null
+
+            if ($LASTEXITCODE -eq 0 -and $ipOutput) {
+              $tsIP = ($ipOutput | Select-Object -First 1).Trim()
+            }
 
             if ($tsIP) {
               break
@@ -116,36 +151,22 @@ jobs:
           }
 
           if (-not $tsIP) {
-            Write-Error "Tailscale IP not assigned."
-            exit 1
+            throw "Tailscale IP was not assigned."
           }
 
-          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          "TAILSCALE_IP=$tsIP" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Append `
+            -Encoding utf8
 
-          Write-Host "Tailscale IP assigned."
+          Write-Host "Tailscale connection established."
+          Write-Host "Tailscale IP: $tsIP"
 
-- name: Start Tailscale File Receiver
-        shell: powershell
-        run: |
-          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          $downloadFolder = "C:\Users\Zwiderh\Downloads"
-
-          New-Item -ItemType Directory `
-            -Path $downloadFolder -Force | Out-Null
-
-          $receiver = Start-Process `
-            -FilePath $tailscale `
-            -ArgumentList @("file", "get", $downloadFolder) `
-            -PassThru `
-            -WindowStyle Hidden
-
-          Write-Host "File receiver started."
-          Write-Host "Receiver process ID: $($receiver.Id)"
-          Write-Host "Destination: $downloadFolder"
-          
       - name: Verify RDP Accessibility
         shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
+
           Write-Host "Testing RDP connectivity..."
 
           $testResult = Test-NetConnection `
@@ -154,8 +175,7 @@ jobs:
             -WarningAction SilentlyContinue
 
           if (-not $testResult.TcpTestSucceeded) {
-            Write-Error "TCP connection to RDP port 3389 failed."
-            exit 1
+            throw "TCP connection to RDP port 3389 failed."
           }
 
           Write-Host "TCP connectivity successful."
@@ -167,7 +187,7 @@ jobs:
           Write-Host "=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: Zwiderh"
-          Write-Host "Password: [hidden]"
+          Write-Host "Password: Use your RDP_PASSWORD secret"
           Write-Host "=================="
           Write-Host ""
 
