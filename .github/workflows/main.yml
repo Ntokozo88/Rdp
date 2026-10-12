@@ -124,6 +124,25 @@ jobs:
 
           Write-Host "Tailscale IP assigned."
 
+- name: Start Tailscale File Receiver
+        shell: powershell
+        run: |
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $downloadFolder = "C:\Users\Zwiderh\Downloads"
+
+          New-Item -ItemType Directory `
+            -Path $downloadFolder -Force | Out-Null
+
+          $receiver = Start-Process `
+            -FilePath $tailscale `
+            -ArgumentList @("file", "get", $downloadFolder) `
+            -PassThru `
+            -WindowStyle Hidden
+
+          Write-Host "File receiver started."
+          Write-Host "Receiver process ID: $($receiver.Id)"
+          Write-Host "Destination: $downloadFolder"
+          
       - name: Verify RDP Accessibility
         shell: powershell
         run: |
